@@ -1,0 +1,13 @@
+[project]
+name = "vpg-training"
+version = "0.1.0"
+description = "Train one logit per FLUX.2 Klein attention head (all 600 heads) for visual prompt guidance"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.6",
+    "diffusers>=0.43,<0.44",
+    "transformers>=4.57",
+    "accelerate>=1.5",
+    "pillow>=10",
+    "numpy>=1.26",
+]
