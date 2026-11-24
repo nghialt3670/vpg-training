@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
-"""Train one logit per FLUX.2 Klein attention head (all heads) from compbench-style edit samples.
+"""Learn 600 shared FLUX.2 Klein attention-head logits using local image supervision.
 
-For each sample:
-  1. Denoise with Euler steps (default 30) and classifier-free guidance. During the first
-     `--guided-steps` steps (default 5) the latent is nudged along the gradient of a coverage
-     loss that compares the head-aggregated object attention with the visual prompt density.
-  2. Decode the final latent and compute the image loss: LPIPS inside the edit mask plus L1 outside
-     (`--image-loss mix`, default).
-  3. Backpropagate through the whole trajectory exactly. Each step is recomputed from its
-     stored input latent, so only one step's second-order graph is alive at a time.
-  4. Take an AdamW step on the head logits.
-
-The head logits are the only trainable parameters. The transformer and VAE are frozen.
+At each guided step, compute the original coverage-gradient latent update. For
+selected guided steps, estimate the clean latent as z_guided - sigma * velocity,
+decode it, and optimize the masked image loss. Earlier states are detached:
+this is a local surrogate, NOT the gradient of the full final-image objective.
+Separate VJPs keep the image and second-order guidance graphs out of memory at
+the same time. Optional final-image evaluation uses the actual Euler trajectory.
 """
-
 from __future__ import annotations
-
 import argparse
 import json
 import math
@@ -24,7 +17,6 @@ import time
 import zlib
 from contextlib import nullcontext
 from pathlib import Path
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -34,7 +26,6 @@ from diffusers.pipelines.flux2.pipeline_flux2_klein import compute_empirical_mu,
 from PIL import Image, ImageDraw
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
-
 PATCH = 16  # pixels per token-grid cell (VAE 8x and 2x2 packing)
 TEXT_TOKENS = 256  # text sequence length used for text embeddings and object-token lookup
 TEMPERATURE = 1.0  # softmax temperature over head logits
@@ -44,8 +35,6 @@ EXPECTED_HEADS = 600
 SPLITS = ("add", "remove", "replace")
 VISUALS = ("box", "point", "scribble")
 DTYPE = torch.bfloat16
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default="black-forest-labs/FLUX.2-klein-base-4B")
@@ -55,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0, help="Use only the first N samples in manifest order (0 = all).")
     p.add_argument("--output", type=Path, default=Path("outputs/flux2_heads/head_logits.json"))
     p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--lr", type=float, default=5e-2)
+    p.add_argument("--lr", type=float, default=5e-3)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--steps", type=int, default=20, help="Denoising steps.")
     p.add_argument("--guided-steps", type=int, default=5, help="Leading steps that get the coverage guidance.")
@@ -72,15 +61,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--query-chunk", type=int, default=64, help="Query rows per attention-probability chunk.")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
+    p.add_argument("--local-start", type=int, default=None,
+                   help="First supervised step, zero-indexed; default last 3 guided steps.")
+    p.add_argument("--grad-accum", type=int, default=5,
+                   help="Average sample gradients before an AdamW update.")
+    p.add_argument("--guidance-rms-floor", type=float, default=1e-6,
+                   help="Lower bound on the RMS denominator for latent guidance.")
+    p.add_argument("--eval-every", type=int, default=1,
+                   help="Measure final-image loss every N epochs, 0 disables.")
+    p.add_argument("--diagnose", action="store_true",
+                   help="First sample: repeat fixed-state loss and check a directional derivative.")
+    p.add_argument("--fd-eps", type=float, default=0.01,
+                   help="RMS perturbation of logits for central finite differences.")
     args = p.parse_args()
-    if not 0 <= args.guided_steps <= args.steps:
-        p.error("--guided-steps must be between 0 and --steps")
+    if not 1 <= args.guided_steps <= args.steps:
+        p.error("--guided-steps must be between 1 and --steps")
+    if args.local_start is None:
+        args.local_start = max(0, args.guided_steps - 3)
+    if not 0 <= args.local_start < args.guided_steps:
+        p.error("--local-start must be in [0, guided-steps)")
+    if (args.grad_accum < 1 or args.guidance_rms_floor <= 0 or args.fd_eps <= 0
+            or args.eval_every < 0 or args.epochs < 1 or args.lr <= 0 or args.grad_clip <= 0):
+        p.error("Invalid optimization or diagnostic argument")
     return args
-
-
 # ----------------------------------------------------------------------------- data
-
-
 def load_samples(args: argparse.Namespace) -> list[dict]:
     samples: list[dict] = []
     for split in args.splits:
@@ -98,26 +103,18 @@ def load_samples(args: argparse.Namespace) -> list[dict]:
     if not samples:
         raise SystemExit("No samples found. Check --data-root, --splits and --visuals.")
     return samples
-
-
 def working_size(width: int, height: int, max_side: int) -> tuple[int, int]:
     scale = max_side / max(width, height)
     w = max(PATCH, int(round(width * scale / PATCH)) * PATCH)
     h = max(PATCH, int(round(height * scale / PATCH)) * PATCH)
     return w, h
-
-
 # crc32 instead of hash(): hash() is salted per process.
 def sample_seed(base: int, sample_id: str) -> int:
     return (base * 1_000_003 + zlib.crc32(sample_id.encode())) % 2**31
-
-
 def pil_to_tensor(img: Image.Image) -> torch.Tensor:
     """PIL RGB -> float32 tensor [1, 3, H, W] in [0, 1]."""
     arr = np.asarray(img, dtype=np.float32) / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-
-
 def object_token_indices(tokenizer, prompt: str, phrase: str) -> torch.Tensor | None:
     """Token indices of the object phrase inside the chat-templated prompt the text encoder sees."""
     text = tokenizer.apply_chat_template(
@@ -135,8 +132,6 @@ def object_token_indices(tokenizer, prompt: str, phrase: str) -> torch.Tensor | 
     enc = tokenizer(text, padding="max_length", truncation=True, max_length=TEXT_TOKENS, return_offsets_mapping=True)
     inds = [i for i, (s, e) in enumerate(enc["offset_mapping"]) if e > s and s < end and e > start]
     return torch.tensor(inds, dtype=torch.long) if inds else None
-
-
 def visual_density(
     visual: dict,
     src_w: int,
@@ -148,13 +143,11 @@ def visual_density(
     device: torch.device,
 ) -> torch.Tensor:
     """Normalized density [1, 1, gh, gw] (sums to 1) from a box, point or scribble prompt.
-
     Coordinates are in source-image pixels and are rescaled to the working resolution.
     """
     sx = width / src_w
     sy = height / src_h
     kind = visual["type"]
-
     if kind == "point":
         cx, cy = visual["x"] * sx, visual["y"] * sy
         ys = (torch.arange(gh, device=device, dtype=torch.float32) + 0.5) * PATCH
@@ -188,55 +181,37 @@ def visual_density(
         dens = F.adaptive_max_pool2d(m, (gh, gw))[0, 0]
     else:
         raise ValueError(f"unknown visual type: {kind}")
-
     total = dens.sum()
     if float(total) <= 0:
         raise ValueError("empty density")
     return (dens / total).reshape(1, 1, gh, gw)
-
-
 def edit_mask_tensor(sample: dict, width: int, height: int, device: torch.device) -> torch.Tensor | None:
     if not sample.get("edit_mask"):
         return None
     mask = Image.open(sample["root"] / sample["edit_mask"]).convert("L").resize((width, height), Image.NEAREST)
     arr = np.asarray(mask, dtype=np.float32) / 255.0
     return torch.from_numpy(arr > 0.5).float()[None, None].to(device)
-
-
 # ----------------------------------------------------------------------------- math helpers
-
-
 def pack_tokens_to_grid(tokens: torch.Tensor, gh: int, gw: int) -> torch.Tensor:
     """[B, N, C] -> [B, C, gh, gw]."""
     b, _, c = tokens.shape
     return tokens.transpose(1, 2).reshape(b, c, gh, gw)
-
-
 def unpatchify(z: torch.Tensor) -> torch.Tensor:
     """[B, C, h, w] -> [B, C//4, 2h, 2w] (inverse of the diffusers patchify)."""
     b, c, h, w = z.shape
     z = z.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3)
     return z.reshape(b, c // 4, h * 2, w * 2)
-
-
 def coverage_loss(agg: torch.Tensor, density: torch.Tensor) -> torch.Tensor:
     """Cross-entropy between the visual density and the normalized aggregated object attention."""
     p = agg.clamp_min(EPS)
     p = p / p.sum((-2, -1), keepdim=True).clamp_min(EPS)
     return -(density * p.clamp_min(EPS).log()).sum()
-
-
 def build_lpips(device: torch.device) -> torch.nn.Module:
     import lpips  # imported here so `--image-loss l1` does not need the package
-
     net = lpips.LPIPS(net="alex", spatial=True, verbose=False)
     return net.to(device).eval().requires_grad_(False)
-
-
 def masked_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return (values * weights).sum() / weights.sum().clamp_min(1.0)
-
-
 def image_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -258,13 +233,9 @@ def image_loss(
     if mode == "mix":
         loss = loss + bg_weight * masked_mean((pred - target).abs(), outside)
     return loss
-
-
 def sdpa_math():
     """Math SDPA kernel for the guidance pass; the fused kernels lack second-order grads."""
     return sdpa_kernel([SDPBackend.MATH])
-
-
 def head_labels(transformer) -> list[str]:
     labels = []
     for i, _ in enumerate(transformer.transformer_blocks):
@@ -272,19 +243,13 @@ def head_labels(transformer) -> list[str]:
     for i, _ in enumerate(transformer.single_transformer_blocks):
         labels += [f"S{i}:H{h:02d}" for h in range(transformer.config.num_attention_heads)]
     return labels
-
-
 # ----------------------------------------------------------------------------- head capture
-
-
 class HeadCapture:
     """Pre-hooks on every attention module that compute per-head object attention probabilities.
-
     For each head, prob = sum over object tokens of softmax(q k^T / sqrt(d)), computed on the
     image-query rows against all keys. Queries and keys are rebuilt from the attention inputs
     with RoPE applied, so the probabilities match the forward pass.
     """
-
     def __init__(self, transformer, chunk: int):
         self.transformer = transformer
         self.chunk = chunk
@@ -298,16 +263,13 @@ class HeadCapture:
             block.attn.register_forward_pre_hook(self._make_hook(f"D{i}", double=True), with_kwargs=True)
         for i, block in enumerate(transformer.single_transformer_blocks):
             block.attn.register_forward_pre_hook(self._make_hook(f"S{i}", double=False), with_kwargs=True)
-
     def _make_hook(self, prefix: str, double: bool):
         def hook(module, args, kwargs):
             if self.enabled:
                 probs = self._probs(module, kwargs, double)  # [B, H, n]
                 self.maps[prefix] = probs
             return None
-
         return hook
-
     def _probs(self, attn, kwargs: dict, double: bool) -> torch.Tensor:
         h = kwargs["hidden_states"]
         rope = kwargs["image_rotary_emb"]
@@ -330,7 +292,6 @@ class HeadCapture:
             k = attn.norm_k(k.unflatten(-1, (-1, hd)))
         q = apply_rotary_emb(q, rope, sequence_dim=1)
         k = apply_rotary_emb(k, rope, sequence_dim=1)
-
         t0, n = self.text_len, self.n_img
         q_img = q[:, t0 : t0 + n].transpose(1, 2).float()  # [B, H, n, D]
         k_t = k.transpose(1, 2).float().transpose(-1, -2)  # [B, H, D, L]
@@ -341,22 +302,16 @@ class HeadCapture:
             nums.append(logits.index_select(-1, self.inds).logsumexp(-1))
             dens.append(logits.logsumexp(-1))
         return torch.exp(torch.cat(nums, -1) - torch.cat(dens, -1))
-
     def aggregate(self, weights: torch.Tensor) -> torch.Tensor:
         """Weighted sum of all head probabilities -> [B, n]."""
         probs = torch.cat([self.maps[prefix] for prefix in self._block_prefixes()], dim=1)  # [B, 600, n]
         return (probs * weights.view(1, -1, 1)).sum(1)
-
     def _block_prefixes(self) -> list[str]:
         t = self.transformer
         return [f"D{i}" for i in range(len(t.transformer_blocks))] + [
             f"S{i}" for i in range(len(t.single_transformer_blocks))
         ]
-
-
 # ----------------------------------------------------------------------------- trainer
-
-
 class HeadTrainer:
     def __init__(self, pipe, args: argparse.Namespace):
         self.pipe = pipe
@@ -368,11 +323,9 @@ class HeadTrainer:
         if self.n_heads_total != EXPECTED_HEADS:
             raise SystemExit(f"Expected {EXPECTED_HEADS} heads, transformer config gives {self.n_heads_total}.")
         self.labels = head_labels(self.tr)
-
         self.tr.requires_grad_(False).eval()
         self.vae.requires_grad_(False).eval()
         self.tr.enable_gradient_checkpointing(gradient_checkpointing_func=self._checkpoint)
-
         self.logits = torch.nn.Parameter(torch.zeros(self.n_heads_total, device=self.device))
         self.optim = torch.optim.AdamW([self.logits], lr=args.lr, weight_decay=0.0)
         self.lpips_net: torch.nn.Module | None = None
@@ -381,11 +334,11 @@ class HeadTrainer:
         self.neg_emb: torch.Tensor | None = None
         self.neg_ids: torch.Tensor | None = None
         self.cov_log: list[torch.Tensor] = []
+        self.rms_log: list[torch.Tensor] = []
+        self.did_diagnose = False
         self.in_channels = self.tr.config.in_channels // 4
         self.gh = self.gw = 0
-
     # --- text ---------------------------------------------------------------
-
     @torch.no_grad()
     def precompute_text(self, samples: list[dict]) -> list[dict]:
         """Embed every unique prompt and the empty negative prompt, then drop the text encoder."""
@@ -411,9 +364,7 @@ class HeadTrainer:
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
         return kept
-
     # --- per-sample state ---------------------------------------------------
-
     @torch.no_grad()
     def prepare(self, s: dict) -> dict:
         inp = Image.open(s["root"] / s["input_image"]).convert("RGB")
@@ -421,15 +372,12 @@ class HeadTrainer:
         src_w, src_h = inp.size
         width, height = working_size(src_w, src_h, self.args.max_side)
         gh, gw = height // PATCH, width // PATCH
-
         density = visual_density(s["visual"], src_w, src_h, width, height, gh, gw, self.device)
         edit = edit_mask_tensor(s, width, height, self.device)
         if edit is None:
             edit = F.interpolate((density > 0).float(), size=(height, width), mode="nearest")
-
         ref_img = pil_to_tensor(inp.resize((width, height), Image.BICUBIC)).to(self.device) * 2 - 1
         target = pil_to_tensor(tgt.resize((width, height), Image.BICUBIC)).to(self.device)
-
         gen = torch.Generator(device=self.device).manual_seed(sample_seed(self.args.seed, s["id"]))
         ref_tokens, ref_ids = self.pipe.prepare_image_latents(
             images=[ref_img], batch_size=1, generator=gen, device=self.device, dtype=DTYPE
@@ -446,7 +394,6 @@ class HeadTrainer:
         n_img = latents.shape[1]
         if n_img != gh * gw:
             raise RuntimeError(f"token count {n_img} != grid {gh}x{gw}")
-
         mu = compute_empirical_mu(image_seq_len=n_img, num_steps=self.args.steps)
         scheduler = self.pipe.scheduler
         sigmas_np = None if getattr(scheduler.config, "use_flow_sigmas", False) else np.linspace(
@@ -458,7 +405,6 @@ class HeadTrainer:
         sigmas = scheduler.sigmas.to(self.device, torch.float32)
         if len(sigmas) != self.args.steps + 1:
             raise RuntimeError(f"expected {self.args.steps + 1} sigmas, got {len(sigmas)}")
-
         emb, text_ids = self.prompt_cache[s["prompt"]]
         return {
             "gh": gh,
@@ -476,20 +422,16 @@ class HeadTrainer:
             "timesteps": timesteps.to(self.device, torch.float32),
             "sigmas": sigmas,
         }
-
     def set_sample(self, st: dict) -> None:
         self.st = st
         self.gh, self.gw = st["gh"], st["gw"]
         self.capture.text_len = TEXT_TOKENS
         self.capture.n_img = st["n_img"]
         self.capture.inds = st["inds"]
-
     # --- model calls --------------------------------------------------------
-
     def _checkpoint(self, fn, *args):
         """Non-reentrant block checkpoint. Recomputation reuses the forward's capture flag and SDPA kernel."""
         on = self.capture.enabled
-
         def run(*inputs):
             prev = self.capture.enabled
             self.capture.enabled = on
@@ -498,9 +440,7 @@ class HeadTrainer:
                     return fn(*inputs)
             finally:
                 self.capture.enabled = prev
-
         return checkpoint(run, *args, use_reentrant=False)
-
     def _model(self, x: torch.Tensor, k: int, emb: torch.Tensor, txt_ids: torch.Tensor) -> torch.Tensor:
         """Batch size is taken from `emb`; `x` is broadcast to it."""
         st = self.st
@@ -517,20 +457,18 @@ class HeadTrainer:
             return_dict=False,
         )[0]
         return out[:, : st["n_img"]].float()
-
-    def _denoise(self, x: torch.Tensor, k: int) -> torch.Tensor:
-        """One Euler step with classifier-free guidance. Returns the next latent (float32)."""
+    def _velocity(self, x: torch.Tensor, k: int) -> torch.Tensor:
+        """Classifier-free guided velocity in FP32."""
         st = self.st
         emb = torch.cat([st["cond_emb"], self.neg_emb])
         ids = torch.cat([st["cond_ids"], self.neg_ids])
         cond, neg = self._model(x, k, emb, ids).chunk(2)
-        v = neg + self.args.cfg * (cond - neg)
-        dt = st["sigmas"][k + 1] - st["sigmas"][k]
-        return x + dt * v
-
+        return neg + self.args.cfg * (cond - neg)
+    def _denoise(self, x: torch.Tensor, k: int) -> torch.Tensor:
+        dt = self.st["sigmas"][k + 1] - self.st["sigmas"][k]
+        return x + dt * self._velocity(x, k)
     def _guide(self, x: torch.Tensor, k: int, create_graph: bool) -> torch.Tensor:
         """Coverage-gradient nudge for step k.
-
         With create_graph=False, x is detached and the result is a plain tensor.
         With create_graph=True, the result stays differentiable with respect to x and the logits.
         """
@@ -549,15 +487,18 @@ class HeadTrainer:
             if not create_graph:
                 self.cov_log.append(loss.detach())
             (g,) = torch.autograd.grad(loss, x_leaf, create_graph=create_graph)
-            scale = g.square().mean().clamp_min(1e-16).sqrt()
+            mean_sq = g.float().square().mean()
+            scale = mean_sq.clamp_min(self.args.guidance_rms_floor ** 2).sqrt()
+            if not create_graph:
+                self.rms_log.append(mean_sq.detach().sqrt())
             x_new = x_leaf - self.args.strength * g / scale
+            # Checkpoint recomputation may repopulate the capture dictionary.
+            self.capture.maps.clear()
         return x_new if create_graph else x_new.detach()
-
     def _step(self, x: torch.Tensor, k: int, guided: bool, create_graph: bool) -> torch.Tensor:
         if guided:
             x = self._guide(x, k, create_graph=create_graph)
         return self._denoise(x, k)
-
     def _decode(self, lat: torch.Tensor) -> torch.Tensor:
         """Final latent [1, N, C] (float32) -> RGB image [1, 3, H, W] in [0, 1]."""
         z = pack_tokens_to_grid(lat.to(DTYPE), self.gh, self.gw)
@@ -567,62 +508,120 @@ class HeadTrainer:
         z = unpatchify(z * std + mean)
         img = self.vae.decode(z, return_dict=False)[0]
         return ((img.float() / 2) + 0.5).clamp(0, 1)
-
     # --- training -----------------------------------------------------------
-
-    def forward_trajectory(self, st: dict) -> tuple[list[torch.Tensor], torch.Tensor]:
-        """Denoise without a graph. Returns the input of every step and the final latent."""
-        traj: list[torch.Tensor] = []
-        x = st["latents"]
-        with torch.no_grad():
-            for k in range(self.args.steps):
-                traj.append(x)
-                x = self._step(x, k, guided=k < self.args.guided_steps, create_graph=False)
-        return traj, x.detach()
-
-    def image_grad(self, final: torch.Tensor, st: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        """Image loss (tensor) and its gradient with respect to the final latent."""
+    def _loss(self, latent: torch.Tensor) -> torch.Tensor:
         if self.args.image_loss != "l1" and self.lpips_net is None:
             self.lpips_net = build_lpips(self.device)
-        lat = final.requires_grad_(True)
+        return image_loss(self._decode(latent), self.st["target"], self.st["edit"],
+                          self.args.image_loss, self.args.bg_weight, self.lpips_net)
+
+    def _local_image_grad(self, guided: torch.Tensor, k: int):
+        """Exact local VJP, split into VAE and velocity passes to reduce peak memory."""
+        sigma = self.st["sigmas"][k]
         with torch.enable_grad():
-            loss = image_loss(
-                self._decode(lat),
-                st["target"],
-                st["edit"],
-                self.args.image_loss,
-                self.args.bg_weight,
-                self.lpips_net,
-            )
-            (g,) = torch.autograd.grad(loss, lat)
-        return loss.detach(), g.detach()
+            y = guided.detach().requires_grad_(True)
+            v = self._velocity(y, k)
+            clean = y - sigma * v
+            clean_leaf = clean.detach().requires_grad_(True)
+            loss = self._loss(clean_leaf)
+            (g_clean,) = torch.autograd.grad(loss, clean_leaf)
+            result = loss.detach()
+            del loss, clean_leaf
+            (g_y,) = torch.autograd.grad(clean, y, grad_outputs=g_clean)
+        return result, g_y.detach(), v.detach()
 
-    def backward_trajectory(self, traj: list[torch.Tensor], g: torch.Tensor) -> None:
-        """Accumulate logit gradients, recomputing one step at a time from its stored input."""
-        for k in reversed(range(self.args.steps)):
-            x_in = traj[k].detach().requires_grad_(True)
+    def _local_head_grad(self, x: torch.Tensor, k: int, g_y: torch.Tensor):
+        """Mixed derivative of the original guidance update wrt head logits."""
+        try:
             with torch.enable_grad():
-                x_next = self._step(x_in, k, guided=k < self.args.guided_steps, create_graph=True)
-                torch.autograd.backward(x_next, g)
-            g = x_in.grad
-            traj[k] = None
-            del x_next, x_in  # release this step's graph before the next one is built
+                x_leaf = x.detach().requires_grad_(True)
+                guided = self._guide(x_leaf, k, create_graph=True)
+                (g_logits,) = torch.autograd.grad(guided, self.logits, grad_outputs=g_y)
+            return g_logits.detach()
+        finally:
+            self.capture.maps.clear()
 
-    def train_sample(self, st: dict) -> tuple[float, float, float]:
-        self.set_sample(st)
-        self.optim.zero_grad(set_to_none=True)
+    @torch.no_grad()
+    def _fixed_state_loss(self, states: list[tuple[int, torch.Tensor]]) -> float:
+        # Only the head logits change. Hold earlier latent states fixed, matching the
+        # stop-gradient local objective used by train_sample.
+        vals = []
         self.cov_log.clear()
-        traj, final = self.forward_trajectory(st)
-        cov = float(torch.stack(self.cov_log).mean()) if self.cov_log else float("nan")
-        loss_img, g = self.image_grad(final, st)
-        self.backward_trajectory(traj, g)
+        self.rms_log.clear()
+        try:
+            for k, x in states:
+                y = self._guide(x, k, create_graph=False)
+                clean = y - self.st["sigmas"][k] * self._velocity(y, k)
+                vals.append(float(self._loss(clean)))
+            return sum(vals) / len(vals)
+        finally:
+            self.cov_log.clear()
+            self.rms_log.clear()
 
-        grad_norm = torch.nn.utils.clip_grad_norm_([self.logits], self.args.grad_clip)
-        if torch.isfinite(grad_norm):
-            self.optim.step()
-        else:
-            print("  non-finite gradient, step skipped")
-        return float(loss_img), float(grad_norm), cov
+    @torch.no_grad()
+    def _diagnose(self, states, grad):
+        original = self.logits.detach().clone()
+        try:
+            base = self._fixed_state_loss(states)
+            repeat = self._fixed_state_loss(states)
+            print(f"  diagnostic: fixed loss={base:.7f}, repeat={repeat:.7f}, "
+                  f"abs_diff={abs(base-repeat):.3e}", flush=True)
+            if not torch.isfinite(grad).all() or float(grad.norm()) == 0:
+                print("  diagnostic: invalid or zero gradient; skipping finite difference", flush=True)
+                return
+            direction = grad / grad.square().mean().sqrt()
+            predicted = float((grad * direction).sum())
+            for eps in (self.args.fd_eps, self.args.fd_eps * 3):
+                self.logits.copy_(original + eps * direction)
+                plus = self._fixed_state_loss(states)
+                self.logits.copy_(original - eps * direction)
+                minus = self._fixed_state_loss(states)
+                fd = (plus - minus) / (2 * eps)
+                print(f"  diagnostic: eps={eps:g} auto={predicted:.6g} fd={fd:.6g} "
+                      f"loss(-eps)={minus:.7f} loss(+eps)={plus:.7f}", flush=True)
+        finally:
+            self.logits.copy_(original)
+
+    def train_sample(self, st: dict, evaluate_final: bool):
+        self.set_sample(st)
+        self.cov_log.clear()
+        self.rms_log.clear()
+        x = st["latents"].detach()
+        gradients = torch.zeros_like(self.logits)
+        losses, states = [], []
+        n_supervised = self.args.guided_steps - self.args.local_start
+        diagnose = self.args.diagnose and not self.did_diagnose
+        for k in range(self.args.guided_steps):
+            # The forward update is the same as the original inference guidance.
+            with torch.no_grad():
+                y = self._guide(x, k, create_graph=False)
+            if k >= self.args.local_start:
+                if diagnose:
+                    states.append((k, x.detach()))
+                loss, g_y, v = self._local_image_grad(y, k)
+                g_logits = self._local_head_grad(x, k, g_y)
+                gradients.add_(g_logits / n_supervised)
+                losses.append(float(loss))
+                del g_y, g_logits, loss
+            else:
+                with torch.no_grad():
+                    v = self._velocity(y, k)
+            with torch.no_grad():
+                dt = st["sigmas"][k + 1] - st["sigmas"][k]
+                x = (y + dt * v).detach()
+            del y, v
+        cov = float(torch.stack(self.cov_log).mean())
+        rms = float(torch.stack(self.rms_log).mean())
+        final_loss = None
+        if evaluate_final:
+            with torch.no_grad():
+                for k in range(self.args.guided_steps, self.args.steps):
+                    x = self._denoise(x, k)
+                final_loss = float(self._loss(x))
+        if diagnose:
+            self._diagnose(states, gradients)
+            self.did_diagnose = True
+        return sum(losses) / len(losses), gradients, cov, rms, final_loss, losses
 
     def save(self, path: Path, epoch: int, history: list[dict]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -639,13 +638,30 @@ class HeadTrainer:
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2))
         tmp.replace(path)
-
     def train(self, samples: list[dict]) -> None:
         history: list[dict] = []
         total = len(samples)
         for epoch in range(self.args.epochs):
             order = list(range(total))
             random.Random(self.args.seed + epoch).shuffle(order)
+            batch_grad = torch.zeros_like(self.logits)
+            batch_count = 0
+            epoch_records = []
+            evaluate = self.args.eval_every > 0 and epoch % self.args.eval_every == 0
+            def update():
+                nonlocal batch_count
+                if not batch_count:
+                    return
+                self.optim.zero_grad(set_to_none=True)
+                self.logits.grad = batch_grad / batch_count
+                norm = torch.nn.utils.clip_grad_norm_([self.logits], self.args.grad_clip)
+                if torch.isfinite(norm):
+                    self.optim.step()
+                else:
+                    print("  non-finite batch gradient, update skipped", flush=True)
+                self.optim.zero_grad(set_to_none=True)
+                batch_grad.zero_()
+                batch_count = 0
             for n, i in enumerate(order):
                 s = samples[i]
                 t0 = time.time()
@@ -653,56 +669,68 @@ class HeadTrainer:
                     torch.cuda.reset_peak_memory_stats(self.device)
                 try:
                     st = self.prepare(s)
-                    loss, grad_norm, cov = self.train_sample(st)
+                    loss, grad, cov, rms, final, per_step = self.train_sample(st, evaluate)
                 except ValueError as exc:
-                    print(f"skip {s['id']}: {exc}")
+                    print(f"skip {s['id']}: {exc}", flush=True)
                     continue
+                norm = float(grad.norm())
+                valid = math.isfinite(loss) and bool(torch.isfinite(grad).all())
+                if valid:
+                    batch_grad.add_(grad)
+                    batch_count += 1
+                else:
+                    print("  non-finite sample loss/gradient, skipped", flush=True)
+                if batch_count >= self.args.grad_accum or n == total - 1:
+                    update()
                 peak = torch.cuda.max_memory_allocated(self.device) / 2**30 if self.device.type == "cuda" else 0.0
                 dt = time.time() - t0
                 w = torch.softmax(self.logits.detach() / TEMPERATURE, 0)
                 spread = float(w.max() / w.min())
-                record = {
-                    "epoch": epoch,
-                    "id": s["id"],
-                    "split": s.get("split"),
-                    "visual": s["visual"]["type"],
-                    "loss": loss,
-                    "coverage": cov,
-                    "weight_spread": spread,
-                    "grad_norm": grad_norm,
-                    "peak_gib": peak,
-                    "seconds": dt,
-                }
+                record = dict(epoch=epoch, id=s["id"], split=s.get("split"),
+                              visual=s["visual"]["type"], loss=loss, local_loss=loss,
+                              local_losses=per_step, final_loss=final, coverage=cov,
+                              guidance_rms=rms, weight_spread=spread, grad_norm=norm,
+                              peak_gib=peak, seconds=dt, valid=valid)
                 history.append(record)
-                print(
-                    f"[epoch {epoch + 1}/{self.args.epochs}] {n + 1}/{total} {s['id']} "
-                    f"loss={loss:.4f} cov={cov:.4f} wspread={spread:.4f} gnorm={grad_norm:.3e} "
-                    f"peak={peak:.2f}GiB time={dt:.1f}s",
-                    flush=True,
-                )
+                if valid:
+                    epoch_records.append(record)
+                final_str = f"{final:.4f}" if final is not None else "n/a"
+                print(f"[epoch {epoch+1}/{self.args.epochs}] {n+1}/{total} {s['id']} "
+                      f"local={loss:.4f} final={final_str} cov={cov:.4f} "
+                      f"rms={rms:.3e} wspread={spread:.4f} gnorm={norm:.3e} "
+                      f"peak={peak:.2f}GiB time={dt:.1f}s", flush=True)
                 self.save(self.args.output, epoch, history)
-                del st
-        self.save(self.args.output, self.args.epochs - 1, history)
-
+                del st, grad
+            update()  # also flush when the final sample was skipped
+            if epoch_records:
+                avg = sum(r["local_loss"] for r in epoch_records) / len(epoch_records)
+                finals = [r["final_loss"] for r in epoch_records if r["final_loss"] is not None]
+                final_avg = f"{sum(finals)/len(finals):.4f}" if finals else "n/a"
+                print(f"[epoch {epoch+1} mean] local={avg:.5f} final={final_avg} "
+                      f"valid={len(epoch_records)}/{total}", flush=True)
+            self.save(self.args.output, epoch, history)
 
 def main() -> None:
+    global DTYPE
     args = parse_args()
+    DTYPE = torch.float32 if args.dtype == "fp32" else torch.bfloat16
+    if args.dtype == "fp32":
+        torch.set_float32_matmul_precision("highest")
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-
     samples = load_samples(args)
     print(f"loaded {len(samples)} samples")
-
     pipe = Flux2KleinPipeline.from_pretrained(args.model, torch_dtype=DTYPE)
     pipe.to(device)
-
     trainer = HeadTrainer(pipe, args)
     samples = trainer.precompute_text(samples)
     if not samples:
         raise SystemExit("No usable samples after text preprocessing.")
     print(f"{len(samples)} samples, {trainer.n_heads_total} heads, output {args.output}")
+    print(f"Local supervision: steps {args.local_start}..{args.guided_steps-1} (zero-indexed), dtype={args.dtype}, accumulation={args.grad_accum}", flush=True)
     trainer.train(samples)
-
-
 if __name__ == "__main__":
     main()
