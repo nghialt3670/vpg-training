@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--steps", type=int, default=30, help="Denoising steps.")
+    p.add_argument("--steps", type=int, default=20, help="Denoising steps.")
     p.add_argument("--guided-steps", type=int, default=5, help="Leading steps that get the coverage guidance.")
     p.add_argument("--max-side", type=int, default=512)
     p.add_argument("--cfg", type=float, default=4.0)
