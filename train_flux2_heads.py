@@ -21,6 +21,7 @@ import json
 import math
 import random
 import time
+import zlib
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -54,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0, help="Use only the first N samples in manifest order (0 = all).")
     p.add_argument("--output", type=Path, default=Path("outputs/flux2_heads/head_logits.json"))
     p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=5e-2)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--steps", type=int, default=20, help="Denoising steps.")
     p.add_argument("--guided-steps", type=int, default=5, help="Leading steps that get the coverage guidance.")
@@ -104,6 +105,11 @@ def working_size(width: int, height: int, max_side: int) -> tuple[int, int]:
     w = max(PATCH, int(round(width * scale / PATCH)) * PATCH)
     h = max(PATCH, int(round(height * scale / PATCH)) * PATCH)
     return w, h
+
+
+# crc32 instead of hash(): hash() is salted per process.
+def sample_seed(base: int, sample_id: str) -> int:
+    return (base * 1_000_003 + zlib.crc32(sample_id.encode())) % 2**31
 
 
 def pil_to_tensor(img: Image.Image) -> torch.Tensor:
@@ -374,7 +380,7 @@ class HeadTrainer:
         self.prompt_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self.neg_emb: torch.Tensor | None = None
         self.neg_ids: torch.Tensor | None = None
-        self.gen = torch.Generator(device=self.device).manual_seed(args.seed)
+        self.cov_log: list[torch.Tensor] = []
         self.in_channels = self.tr.config.in_channels // 4
         self.gh = self.gw = 0
 
@@ -424,8 +430,9 @@ class HeadTrainer:
         ref_img = pil_to_tensor(inp.resize((width, height), Image.BICUBIC)).to(self.device) * 2 - 1
         target = pil_to_tensor(tgt.resize((width, height), Image.BICUBIC)).to(self.device)
 
+        gen = torch.Generator(device=self.device).manual_seed(sample_seed(self.args.seed, s["id"]))
         ref_tokens, ref_ids = self.pipe.prepare_image_latents(
-            images=[ref_img], batch_size=1, generator=self.gen, device=self.device, dtype=DTYPE
+            images=[ref_img], batch_size=1, generator=gen, device=self.device, dtype=DTYPE
         )
         latents, latent_ids = self.pipe.prepare_latents(
             batch_size=1,
@@ -434,7 +441,7 @@ class HeadTrainer:
             width=width,
             dtype=DTYPE,
             device=self.device,
-            generator=self.gen,
+            generator=gen,
         )
         n_img = latents.shape[1]
         if n_img != gh * gw:
@@ -539,6 +546,8 @@ class HeadTrainer:
             agg = self.capture.aggregate(weights).reshape(1, 1, self.gh, self.gw)
             self.capture.maps = {}
             loss = coverage_loss(agg, self.st["density"])
+            if not create_graph:
+                self.cov_log.append(loss.detach())
             (g,) = torch.autograd.grad(loss, x_leaf, create_graph=create_graph)
             scale = g.square().mean().clamp_min(1e-16).sqrt()
             x_new = x_leaf - self.args.strength * g / scale
@@ -599,10 +608,12 @@ class HeadTrainer:
             traj[k] = None
             del x_next, x_in  # release this step's graph before the next one is built
 
-    def train_sample(self, st: dict) -> tuple[float, float]:
+    def train_sample(self, st: dict) -> tuple[float, float, float]:
         self.set_sample(st)
         self.optim.zero_grad(set_to_none=True)
+        self.cov_log.clear()
         traj, final = self.forward_trajectory(st)
+        cov = float(torch.stack(self.cov_log).mean()) if self.cov_log else float("nan")
         loss_img, g = self.image_grad(final, st)
         self.backward_trajectory(traj, g)
 
@@ -611,7 +622,7 @@ class HeadTrainer:
             self.optim.step()
         else:
             print("  non-finite gradient, step skipped")
-        return float(loss_img), float(grad_norm)
+        return float(loss_img), float(grad_norm), cov
 
     def save(self, path: Path, epoch: int, history: list[dict]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -642,18 +653,22 @@ class HeadTrainer:
                     torch.cuda.reset_peak_memory_stats(self.device)
                 try:
                     st = self.prepare(s)
-                    loss, grad_norm = self.train_sample(st)
+                    loss, grad_norm, cov = self.train_sample(st)
                 except ValueError as exc:
                     print(f"skip {s['id']}: {exc}")
                     continue
                 peak = torch.cuda.max_memory_allocated(self.device) / 2**30 if self.device.type == "cuda" else 0.0
                 dt = time.time() - t0
+                w = torch.softmax(self.logits.detach() / TEMPERATURE, 0)
+                spread = float(w.max() / w.min())
                 record = {
                     "epoch": epoch,
                     "id": s["id"],
                     "split": s.get("split"),
                     "visual": s["visual"]["type"],
                     "loss": loss,
+                    "coverage": cov,
+                    "weight_spread": spread,
                     "grad_norm": grad_norm,
                     "peak_gib": peak,
                     "seconds": dt,
@@ -661,7 +676,8 @@ class HeadTrainer:
                 history.append(record)
                 print(
                     f"[epoch {epoch + 1}/{self.args.epochs}] {n + 1}/{total} {s['id']} "
-                    f"loss={loss:.4f} gnorm={grad_norm:.3e} peak={peak:.2f}GiB time={dt:.1f}s",
+                    f"loss={loss:.4f} cov={cov:.4f} wspread={spread:.4f} gnorm={grad_norm:.3e} "
+                    f"peak={peak:.2f}GiB time={dt:.1f}s",
                     flush=True,
                 )
                 self.save(self.args.output, epoch, history)
