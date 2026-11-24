@@ -5,7 +5,8 @@ For each sample:
   1. Denoise with Euler steps (default 30) and classifier-free guidance. During the first
      `--guided-steps` steps (default 5) the latent is nudged along the gradient of a coverage
      loss that compares the head-aggregated object attention with the visual prompt density.
-  2. Decode the final latent and compute an L1 image loss inside and outside the edit mask.
+  2. Decode the final latent and compute the image loss: LPIPS inside the edit mask plus L1 outside
+     (`--image-loss mix`, default).
   3. Backpropagate through the whole trajectory exactly. Each step is recomputed from its
      stored input latent, so only one step's second-order graph is alive at a time.
   4. Take an AdamW step on the head logits.
@@ -60,6 +61,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-side", type=int, default=512)
     p.add_argument("--cfg", type=float, default=4.0)
     p.add_argument("--strength", type=float, default=0.03)
+    p.add_argument(
+        "--image-loss",
+        choices=("l1", "lpips", "mix"),
+        default="mix",
+        help="l1: masked L1 inside and outside. lpips: masked LPIPS inside. mix: LPIPS inside plus L1 outside.",
+    )
+    p.add_argument("--bg-weight", type=float, default=1.0, help="Weight of the outside L1 term in mix mode.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--query-chunk", type=int, default=64, help="Query rows per attention-probability chunk.")
     p.add_argument("--device", default="cuda")
@@ -212,15 +220,38 @@ def coverage_loss(agg: torch.Tensor, density: torch.Tensor) -> torch.Tensor:
     return -(density * p.clamp_min(EPS).log()).sum()
 
 
-def image_loss(pred: torch.Tensor, target: torch.Tensor, edit: torch.Tensor | None) -> torch.Tensor:
-    diff = (pred - target).abs()
-    if edit is None:
-        return diff.mean()
-    inside = edit.expand_as(diff)
+def build_lpips(device: torch.device) -> torch.nn.Module:
+    import lpips  # imported here so `--image-loss l1` does not need the package
+
+    net = lpips.LPIPS(net="alex", spatial=True, verbose=False)
+    return net.to(device).eval().requires_grad_(False)
+
+
+def masked_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    return (values * weights).sum() / weights.sum().clamp_min(1.0)
+
+
+def image_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    edit: torch.Tensor | None,
+    mode: str,
+    bg_weight: float,
+    lpips_net: torch.nn.Module | None = None,
+) -> torch.Tensor:
+    mask = edit if edit is not None else torch.ones_like(pred[:, :1])
+    inside = mask.expand_as(pred)
     outside = 1.0 - inside
-    l_in = (diff * inside).sum() / inside.sum().clamp_min(1.0)
-    l_out = (diff * outside).sum() / outside.sum().clamp_min(1.0)
-    return l_in + l_out
+    if mode == "l1":
+        diff = (pred - target).abs()
+        return masked_mean(diff, inside) + masked_mean(diff, outside)
+    d = lpips_net(pred * 2 - 1, target * 2 - 1)
+    if d.shape[-2:] != mask.shape[-2:]:
+        d = F.interpolate(d, size=mask.shape[-2:], mode="bilinear", align_corners=False)
+    loss = masked_mean(d, mask)
+    if mode == "mix":
+        loss = loss + bg_weight * masked_mean((pred - target).abs(), outside)
+    return loss
 
 
 def sdpa_math():
@@ -338,6 +369,7 @@ class HeadTrainer:
 
         self.logits = torch.nn.Parameter(torch.zeros(self.n_heads_total, device=self.device))
         self.optim = torch.optim.AdamW([self.logits], lr=args.lr, weight_decay=0.0)
+        self.lpips_net: torch.nn.Module | None = None
         self.capture = HeadCapture(self.tr, args.query_chunk)
         self.prompt_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self.neg_emb: torch.Tensor | None = None
@@ -541,9 +573,18 @@ class HeadTrainer:
 
     def image_grad(self, final: torch.Tensor, st: dict) -> tuple[torch.Tensor, torch.Tensor]:
         """Image loss (tensor) and its gradient with respect to the final latent."""
+        if self.args.image_loss != "l1" and self.lpips_net is None:
+            self.lpips_net = build_lpips(self.device)
         lat = final.requires_grad_(True)
         with torch.enable_grad():
-            loss = image_loss(self._decode(lat), st["target"], st["edit"])
+            loss = image_loss(
+                self._decode(lat),
+                st["target"],
+                st["edit"],
+                self.args.image_loss,
+                self.args.bg_weight,
+                self.lpips_net,
+            )
             (g,) = torch.autograd.grad(loss, lat)
         return loss.detach(), g.detach()
 

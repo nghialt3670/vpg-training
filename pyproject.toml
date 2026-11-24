@@ -10,4 +10,5 @@ dependencies = [
     "accelerate>=1.5",
     "pillow>=10",
     "numpy>=1.26",
+    "lpips>=0.1.4",
 ]
