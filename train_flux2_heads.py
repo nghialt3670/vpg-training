@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--visuals", nargs="+", default=list(VISUALS), choices=VISUALS)
     p.add_argument("--limit", type=int, default=0, help="Use only the first N samples in manifest order (0 = all).")
     p.add_argument("--output", type=Path, default=Path("outputs/flux2_heads/head_logits.json"))
-    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--steps", type=int, default=30, help="Denoising steps.")
@@ -463,16 +463,18 @@ class HeadTrainer:
         return checkpoint(run, *args, use_reentrant=False)
 
     def _model(self, x: torch.Tensor, k: int, emb: torch.Tensor, txt_ids: torch.Tensor) -> torch.Tensor:
+        """Batch size is taken from `emb`; `x` is broadcast to it."""
         st = self.st
-        t = st["timesteps"][k].expand(1).to(DTYPE) / 1000
-        hidden = torch.cat([x.to(DTYPE), st["ref"]], dim=1)
+        b = emb.shape[0]
+        t = st["timesteps"][k].expand(b).to(DTYPE) / 1000
+        hidden = torch.cat([x.to(DTYPE).expand(b, -1, -1), st["ref"].expand(b, -1, -1)], dim=1)
         out = self.tr(
             hidden_states=hidden,
             timestep=t,
             guidance=None,
             encoder_hidden_states=emb,
             txt_ids=txt_ids,
-            img_ids=st["img_ids"],
+            img_ids=st["img_ids"].expand(b, -1, -1),
             return_dict=False,
         )[0]
         return out[:, : st["n_img"]].float()
@@ -480,8 +482,9 @@ class HeadTrainer:
     def _denoise(self, x: torch.Tensor, k: int) -> torch.Tensor:
         """One Euler step with classifier-free guidance. Returns the next latent (float32)."""
         st = self.st
-        cond = self._model(x, k, st["cond_emb"], st["cond_ids"])
-        neg = self._model(x, k, self.neg_emb, self.neg_ids)
+        emb = torch.cat([st["cond_emb"], self.neg_emb])
+        ids = torch.cat([st["cond_ids"], self.neg_ids])
+        cond, neg = self._model(x, k, emb, ids).chunk(2)
         v = neg + self.args.cfg * (cond - neg)
         dt = st["sigmas"][k + 1] - st["sigmas"][k]
         return x + dt * v
