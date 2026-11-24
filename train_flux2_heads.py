@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default="black-forest-labs/FLUX.2-klein-base-4B")
     p.add_argument("--data-root", type=Path, default=Path("data/compbench-vpg"))
     p.add_argument("--splits", nargs="+", default=list(SPLITS), choices=SPLITS)
-    p.add_argument("--visuals", nargs="+", default=list(VISUALS), choices=VISUALS)
+    p.add_argument("--visuals", nargs="+", default=["scribble"], choices=VISUALS)
     p.add_argument("--limit", type=int, default=0, help="Use only the first N samples in manifest order (0 = all).")
     p.add_argument("--output", type=Path, default=Path("outputs/flux2_heads/head_logits.json"))
     p.add_argument("--epochs", type=int, default=20)
